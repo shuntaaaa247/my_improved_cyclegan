@@ -41,6 +41,7 @@ test/.coverage
 test/data/legacy_serialized.pt
 *~
 .idea
+environment_for_mac.yml
 
 #Ignore Wandb
 wandb/
