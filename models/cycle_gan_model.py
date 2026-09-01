@@ -159,6 +159,16 @@ class CycleGANModel(BaseModel):
         # YOLO ラベル: collate 後は (M, 6) = [batch_idx, cls, xc, yc, w, h]（クロップ後画像の正規化座標）
         # real_A / real_B に対応する側を取る（--direction BtoA のとき入れ替わる点に注意）
         key_a, key_b = ("labels_A", "labels_B") if AtoB else ("labels_B", "labels_A")
+        # ラベルを返さないデータセットと --lambda_local > 0 の組み合わせは、
+        # 例外を出さずに局所損失が常に 0 になるだけなので設定ミスに気づけない。
+        # 最初のバッチで落として、無駄な学習を回さないようにする。
+        if self.use_local and (key_a not in input or key_b not in input):
+            raise ValueError(
+                f"--lambda_local {self.opt.lambda_local} が指定されていますが、"
+                f"--dataset_mode {self.opt.dataset_mode} は YOLO ラベルを返しません。"
+                " ラベル付きデータセット（--dataset_mode unaligned_labeled）を使うか、"
+                " --lambda_local 0 で局所損失を無効にしてください。"
+            )
         self.labels_A = input[key_a].to(self.device) if key_a in input else None
         self.labels_B = input[key_b].to(self.device) if key_b in input else None
 
@@ -273,8 +283,12 @@ class CycleGANModel(BaseModel):
 
         window = 直近 --local_log_freq 反復分、total = 学習開始からの累積。
         「信号機がちゃんと切り取れているか」は、この採用率と除外理由の内訳を見れば分かる。
+
+        d_step / d_skip は局所Dの更新回数と、real/fake の片側が0件でスキップした回数。
+        used はウィンドウ内の合算なので「採用率100%」に見えても個別の反復では0件が
+        混ざりうる。スキップ率が高いなら、局所Dがそもそも十分に更新されていない。
         """
-        self._stat_keys = ["total", "class_skip", "no_window", "out_of_bounds", "subsampled", "used"]
+        self._stat_keys = ["total", "class_skip", "no_window", "out_of_bounds", "subsampled", "used", "d_step", "d_skip"]
         n_bucket = len(self.local_ctx_sizes)
         make = lambda: {t: dict({k: 0 for k in self._stat_keys}, bucket=[0] * n_bucket) for t in ("A", "B")}
         self.local_stats = make()          # 直近ウィンドウ
@@ -329,6 +343,11 @@ class CycleGANModel(BaseModel):
             )
             buckets = "  ".join(f"{sz}px={n}" for sz, n in zip(self.local_ctx_sizes, w["bucket"]))
             lines.append(f"      バケット内訳: {buckets}")
+            srate = w["d_skip"] / w["d_step"] * 100 if w["d_step"] else 0.0
+            lines.append(
+                f"      局所D更新: {w['d_step'] - w['d_skip']}/{w['d_step']} 回実行"
+                f" (スキップ {w['d_skip']} 回 = {srate:.1f}%, 片側のクロップが0件)"
+            )
         return "\n".join(lines)
 
     def log_local_stats(self, total_iters):
@@ -411,15 +430,31 @@ class CycleGANModel(BaseModel):
             return self.criterionGAN(netD(crops, cls, scale), target_is_real) * 0.0
         return self.criterionGAN(netD(crops, cls, scale), target_is_real)
 
-    def backward_D_local_basic(self, netD, real_images, real_labels, fake_images, fake_labels):
+    def backward_D_local_basic(self, netD, real_images, real_labels, fake_images, fake_labels, stats_tag=None):
         """局所Dの更新。real は本物画像の物体クロップ、fake は生成画像の物体クロップ。
 
         生成側のクロップ位置は「生成元画像のラベル」から取る点が重要
         （fake_B = G_A(real_A) なので幾何は real_A に従う）。
         画像プールは使わない（1ステップあたりのクロップ数が多く、実害が小さいため）。
+
+        real / fake のどちらか一方だけクロップが 0 個の反復では、両方をダミー化して
+        損失を 0 にする。片側だけで更新すると「常に fake と答えろ」（または逆）方向にしか
+        勾配が入らず、Dが偏って G への信号が意味を失うため。物体が写っていない画像は
+        データ中に普通に存在するので、これは恒常的に起きる。
+
+        Parameters:
+            stats_tag (str) -- "A"/"B" を渡すと更新回数とスキップ回数を self.local_stats に
+                               加算する。スキップは損失ログの D_*_local が 0.000 になる以外に
+                               痕跡が残らないので、頻度を明示的に数えておく
         """
         real_crops, real_cls, real_scale = self._extract_crops(real_images, real_labels)
         fake_crops, fake_cls, fake_scale = self._extract_crops(fake_images.detach(), fake_labels)
+        skipped = real_crops is None or fake_crops is None
+        if skipped:
+            real_crops = fake_crops = None  # 両方ダミーにして勾配だけ通す（DDP対策）
+        if stats_tag is not None:
+            self.local_stats[stats_tag]["d_step"] += 1
+            self.local_stats[stats_tag]["d_skip"] += int(skipped)
         loss_real = self._local_gan_loss(netD, real_crops, real_cls, real_scale, True)
         loss_fake = self._local_gan_loss(netD, fake_crops, fake_cls, fake_scale, False)
         loss_D = (loss_real + loss_fake) * 0.5
@@ -454,14 +489,14 @@ class CycleGANModel(BaseModel):
         self.loss_D_A = self.backward_D_basic(self.netD_A, self.real_B, fake_B)
         if self.use_local:
             # 本物 = 実夜間画像の信号機クロップ、偽物 = 昼→夜変換した画像の信号機クロップ
-            self.loss_D_A_local = self.backward_D_local_basic(self.netD_A_local, self.real_B, self.labels_B, self.fake_B, self.labels_A)
+            self.loss_D_A_local = self.backward_D_local_basic(self.netD_A_local, self.real_B, self.labels_B, self.fake_B, self.labels_A, stats_tag="A")
 
     def backward_D_B(self):
         """Calculate GAN loss for discriminator D_B"""
         fake_A = self.fake_A_pool.query(self.fake_A)
         self.loss_D_B = self.backward_D_basic(self.netD_B, self.real_A, fake_A)
         if self.use_local:
-            self.loss_D_B_local = self.backward_D_local_basic(self.netD_B_local, self.real_A, self.labels_A, self.fake_A, self.labels_B)
+            self.loss_D_B_local = self.backward_D_local_basic(self.netD_B_local, self.real_A, self.labels_A, self.fake_A, self.labels_B, stats_tag="B")
 
     def backward_G(self):
         """Calculate the loss for generators G_A and G_B"""
