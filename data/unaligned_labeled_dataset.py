@@ -80,6 +80,11 @@ class UnalignedLabeledDataset(BaseDataset):
         raw = str(getattr(opt, "local_ctx_sizes", "") or "")
         self.ctx_sizes = sorted(int(v) for v in raw.split(",") if v.strip()) or None
         self.ctx_pad = int(getattr(opt, "local_ctx_pad", 16))
+        # object-aware crop は学習時のみ有効にする。テスト時も有効だと評価用クロップが
+        # 「物体を含む」方向に偏り、素のCycleGANをベースラインにした比較が成立しなくなる。
+        # （なお --preprocess crop 系ではクロップ位置自体が乱数なので、テストを決定的に
+        #  したい場合は --preprocess none / resize を使うこと）
+        self.object_aware_p = opt.object_aware_crop_p if opt.isTrain else 0.0
 
         self.dir_A = os.path.join(opt.dataroot, opt.phase + "A")  # create a path '/path/to/data/trainA'
         self.dir_B = os.path.join(opt.dataroot, opt.phase + "B")  # create a path '/path/to/data/trainB'
@@ -156,11 +161,11 @@ class UnalignedLabeledDataset(BaseDataset):
         # A側B側の両方に同じサンプリングポリシーを適用する（片側だけだとクロップ位置の
         # 分布がドメイン間でずれ、大域Dがそれを手がかりにしてしまう）
         transform_params_A = get_params(self.opt, A_img.size, labels=labels_A,
-                                        object_aware_p=self.opt.object_aware_crop_p,
+                                        object_aware_p=self.object_aware_p,
                                         object_margin=self.opt.object_crop_margin,
                                         ctx_sizes=self.ctx_sizes, ctx_pad=self.ctx_pad)
         transform_params_B = get_params(self.opt, B_img.size, labels=labels_B,
-                                        object_aware_p=self.opt.object_aware_crop_p,
+                                        object_aware_p=self.object_aware_p,
                                         object_margin=self.opt.object_crop_margin,
                                         ctx_sizes=self.ctx_sizes, ctx_pad=self.ctx_pad)
 
