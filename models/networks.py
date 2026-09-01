@@ -203,6 +203,34 @@ def define_D(input_nc, ndf, netD, n_layers_D=3, norm="batch", init_type="normal"
     return net
 
 
+def define_local_D(input_nc, ndf, n_layers=2, norm="none", init_type="normal", init_gain=0.02, num_classes=1, num_scales=1, conditional=True):
+    """小物体クロップ用の局所 discriminator を作る。
+
+    大域の PatchGAN (netD_A/netD_B) をそのまま流用してはいけない理由:
+      - basic PatchGAN は受容野 70x70 で、64x64 のクロップより受容野の方が大きく
+        PatchGAN として機能しない（n_layers=2 なら受容野 34 程度で妥当）。
+      - 大域Dは 256/384 の画像統計に適合済みで、クロップの入力分布とは別物。
+
+    Parameters:
+        input_nc (int)     -- 入力チャンネル数
+        ndf (int)          -- 最初の conv のフィルタ数
+        n_layers (int)     -- conv 層の数（64x64 入力なら 2 が目安）
+        norm (str)         -- 正規化層 batch | instance | none。既定は none。
+                              InstanceNorm はサンプルごとに輝度・コントラストを正規化してしまい、
+                              「光っている/いない」という絶対輝度の手がかりを D から奪うため、
+                              自発光物体（信号機）の局所Dには不適切。
+        init_type (str)    -- 重み初期化方法
+        init_gain (float)  -- 初期化のスケール
+        num_classes (int)  -- YOLO のクラス数（conditional=True のとき使用）
+        num_scales (int)   -- スケールバケット数（--local_ctx_sizes の要素数）
+        conditional (bool) -- True で class/scale-conditional (projection) discriminator にする
+
+    Returns a local discriminator
+    """
+    norm_layer = get_norm_layer(norm_type=norm)
+    return LocalDiscriminator(input_nc, ndf, n_layers=n_layers, norm_layer=norm_layer, num_classes=num_classes, num_scales=num_scales, conditional=conditional)
+
+
 ##############################################################################
 # Classes
 ##############################################################################
@@ -553,6 +581,81 @@ class NLayerDiscriminator(nn.Module):
     def forward(self, input):
         """Standard forward."""
         return self.model(input)
+
+
+class LocalDiscriminator(nn.Module):
+    """小物体クロップ用の class-conditional discriminator (projection discriminator)。
+
+    出力 = psi(f) + <embed_cls(class) + embed_scale(bucket), f>   f = 特徴の global average pooling
+
+    クラス条件付けがあることで、「夜の信号機らしいが色がクラスラベルと不一致」な生成結果
+    （赤信号が緑になる等）を fake と判定できる。無条件Dだと "夜らしくリアル" でありさえ
+    すれば損失が下がるため、検出データ拡張としては致命的なラベルノイズを生む。
+
+    スケール条件付けは、大きさの異なる物体を共通の入力サイズにリサイズして扱うために必要。
+    グロー/ボケの半径は絶対ピクセルで決まるので、リサイズすると近距離の信号機と遠距離の
+    信号機で「あるべきボケ量」が変わる。バケットIDを与えることでDがスケールごとの
+    統計を別々にモデル化できる。
+    参考: Miyato & Koyama, "cGANs with Projection Discriminator" (ICLR 2018)
+    """
+
+    def __init__(self, input_nc, ndf=64, n_layers=2, norm_layer=nn.BatchNorm2d, num_classes=1, num_scales=1, conditional=True):
+        """Construct a local (class-conditional) discriminator
+
+        Parameters:
+            input_nc (int)     -- 入力チャンネル数
+            ndf (int)          -- 最初の conv のフィルタ数
+            n_layers (int)     -- conv 層の数
+            norm_layer         -- 正規化層
+            num_classes (int)  -- YOLO のクラス数
+            num_scales (int)   -- スケールバケット数
+            conditional (bool) -- クラス/スケール条件付けを行うか（ablation 用に False にできる）
+        """
+        super(LocalDiscriminator, self).__init__()
+        if type(norm_layer) == functools.partial:
+            use_bias = norm_layer.func == nn.InstanceNorm2d
+        else:
+            use_bias = norm_layer == nn.InstanceNorm2d
+
+        kw = 4
+        padw = 1
+        sequence = [nn.Conv2d(input_nc, ndf, kernel_size=kw, stride=2, padding=padw), nn.LeakyReLU(0.2, True)]
+        nf_mult = 1
+        for n in range(1, n_layers + 1):
+            nf_mult_prev = nf_mult
+            nf_mult = min(2**n, 8)
+            stride = 2 if n < n_layers else 1  # 最終層のみ stride 1
+            sequence += [nn.Conv2d(ndf * nf_mult_prev, ndf * nf_mult, kernel_size=kw, stride=stride, padding=padw, bias=use_bias), norm_layer(ndf * nf_mult), nn.LeakyReLU(0.2, True)]
+        self.features = nn.Sequential(*sequence)
+        self.feat_dim = ndf * nf_mult
+
+        self.psi = nn.Linear(self.feat_dim, 1)  # 無条件項
+        self.conditional = conditional
+        if conditional:
+            self.embed_cls = nn.Embedding(num_classes, self.feat_dim)
+            self.embed_scale = nn.Embedding(num_scales, self.feat_dim)
+            # init_weights は Embedding を初期化しない（Conv/Linear のみ）ので、ここで明示的に。
+            # 既定の N(0, 1) だと学習初期に条件項が無条件項を圧倒する。
+            nn.init.normal_(self.embed_cls.weight, 0.0, 0.02)
+            nn.init.zeros_(self.embed_scale.weight)  # スケール項は0開始（バケットが1つのとき完全に無効）
+
+    def forward(self, input, cls=None, scale=None):
+        """Standard forward.
+
+        Parameters:
+            input (tensor) -- (K, C, d, d) のクロップ（全バケット共通の入力サイズにリサイズ済み）
+            cls (tensor)   -- (K,) long のクラスID。conditional=True のとき必須
+            scale (tensor) -- (K,) long のスケールバケットID
+        """
+        f = self.features(input)  # 実際のパッチから抽出した特徴
+        f = f.mean(dim=(2, 3))  # (K, feat_dim) 総和ではなく平均。LSGAN で出力スケールが暴れないように
+        out = self.psi(f)  # 無条件項。ラベルと無関係に「画像としてリアルか」を測る。（画質、ノイズ、アーティファクト）
+        if self.conditional and cls is not None:
+            cond = self.embed_cls(cls)
+            if scale is not None:
+                cond = cond + self.embed_scale(scale)  # 「クラスID と バケットID から期待される特徴」の理想像
+            out = out + (cond * f).sum(dim=1, keepdim=True)  # 条件項。「そのクラス・そのスケールとして正しいか」を測る。（内積が大きい  → 期待どおり → 本物寄りのスコア、内積が小さい  → 期待とズレ → 偽物寄りのスコア）
+        return out
 
 
 class PixelDiscriminator(nn.Module):
