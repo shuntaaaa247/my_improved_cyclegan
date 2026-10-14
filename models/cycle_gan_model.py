@@ -62,7 +62,9 @@ class CycleGANModel(BaseModel):
             parser.add_argument("--num_classes", type=int, default=80, help="YOLOラベルのクラス数（class-conditional局所Dの埋め込みサイズ）")
             parser.add_argument("--local_log_freq", type=int, default=100, help="この反復数ごとに、局所クロップの採用/除外内訳をログ出力する。0で無効")
             parser.add_argument("--local_vis_max", type=int, default=32, help="可視化に載せる局所クロップの最大枚数")
-            parser.add_argument("--no_local_cond", action="store_true", help="局所Dのクラス/スケール条件付けを無効化する（ablation用）")
+            parser.add_argument("--no_local_cond", action="store_true", help="局所Dのクラス/スケール条件付けを両方とも無効化する（ablation用）。個別フラグより優先")
+            parser.add_argument("--no_local_cls_cond", action="store_true", help="局所Dのクラス条件付けだけを無効化する（ablation用）")
+            parser.add_argument("--no_local_scale_cond", action="store_true", help="局所Dのスケール条件付けだけを無効化する（ablation用）")
 
         return parser
 
@@ -117,8 +119,15 @@ class CycleGANModel(BaseModel):
             if self.use_local:
                 # D_A_local: 夜(B)ドメインの物体クロップ用 / D_B_local: 昼(A)ドメインの物体クロップ用
                 n_scales = len(self.local_ctx_sizes)
-                self.netD_A_local = networks.define_local_D(opt.output_nc, opt.local_ndf, opt.local_n_layers_D, opt.local_norm, opt.init_type, opt.init_gain, opt.num_classes, n_scales, not opt.no_local_cond)
-                self.netD_B_local = networks.define_local_D(opt.input_nc, opt.local_ndf, opt.local_n_layers_D, opt.local_norm, opt.init_type, opt.init_gain, opt.num_classes, n_scales, not opt.no_local_cond)
+                # --no_local_cond は両方を無効化し、個別フラグはそれぞれ片方だけを無効化する
+                use_cls_cond = not (opt.no_local_cond or opt.no_local_cls_cond)
+                use_scale_cond = not (opt.no_local_cond or opt.no_local_scale_cond)
+                if use_scale_cond and n_scales == 1:
+                    # バケットが1つだとスケール項は f の線形関数になり、無条件項 psi と冗長で効果がない
+                    print("Warning: --local_ctx_sizes が単一スケールのため、局所Dのスケール条件付けは実質的に無効です")
+                print("局所D条件付け: class=%s, scale=%s" % (use_cls_cond, use_scale_cond))
+                self.netD_A_local = networks.define_local_D(opt.output_nc, opt.local_ndf, opt.local_n_layers_D, opt.local_norm, opt.init_type, opt.init_gain, opt.num_classes, n_scales, use_cls_cond, use_scale_cond)
+                self.netD_B_local = networks.define_local_D(opt.input_nc, opt.local_ndf, opt.local_n_layers_D, opt.local_norm, opt.init_type, opt.init_gain, opt.num_classes, n_scales, use_cls_cond, use_scale_cond)
 
         if self.isTrain:
             if opt.lambda_identity > 0.0:  # only works when input and output images have the same number of channels
