@@ -372,3 +372,25 @@ python test.py --dataroot ./datasets/day2night --name day2night_local --model cy
 - T. Miyato and M. Koyama, "cGANs with Projection Discriminator," ICLR 2018.
 
 ベースリポジトリの使い方（環境構築、pix2pix、学習のヒント等）は [README_CycleGAN.md](README_CycleGAN.md) および [docs/](docs/) を参照してください。
+
+---
+
+## ライセンス
+
+### コード
+
+本リポジトリのコードは、ベースリポジトリと同じ BSD ライセンスで提供します。条文と元の著作権表示は [LICENSE](LICENSE) を参照してください。
+
+- ベースリポジトリ由来の部分: Copyright (c) 2017, Jun-Yan Zhu and Taesung Park（pix2pix / DCGAN 由来の部分は [LICENSE](LICENSE) に記載の各著作権者）
+- 本リポジトリで追加・改変した部分（Local Crop CycleGAN 関連）: Copyright (c) 2026, shuntaaaa247
+
+本リポジトリはベースリポジトリの作者による公式の実装ではなく、作者の承認や推奨を受けたものでもありません。
+
+### 画像
+
+`imgs/day2night/` の画像は本リポジトリのライセンスの対象外です。
+
+- 昼画像は、撮影者の許可を得て掲載しています。
+- 夜画像は、昼画像を本モデルで変換した生成結果です。
+
+これらの画像の無断での転載・再配布・再利用（学習データとしての利用を含む）はご遠慮ください。
