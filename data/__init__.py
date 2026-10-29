@@ -85,7 +85,16 @@ class CustomDatasetDataLoader:
             self.sampler = None
             shuffle = not opt.serial_batches
 
-        self.dataloader = torch.utils.data.DataLoader(self.dataset, batch_size=opt.batch_size, shuffle=shuffle, sampler=self.sampler, num_workers=int(opt.num_threads))
+        # collate_fn を定義しているデータセットだけそれを使う（未定義なら None = default_collate）
+        collate_fn = getattr(self.dataset, "collate_fn", None)
+        self.dataloader = torch.utils.data.DataLoader(
+            self.dataset,
+            batch_size=opt.batch_size,
+            shuffle=shuffle,
+            sampler=self.sampler,
+            num_workers=int(opt.num_threads),
+            collate_fn=collate_fn
+        )
 
     def load_data(self):
         return self

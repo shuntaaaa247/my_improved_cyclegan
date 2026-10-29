@@ -6,6 +6,8 @@ results/
 build/
 dist/
 *.png
+# README.draft.md の変換結果画像は追跡する
+!imgs/day2night/*.png
 torch.egg-info/
 */**/__pycache__
 torch/version.py
@@ -41,6 +43,8 @@ test/.coverage
 test/data/legacy_serialized.pt
 *~
 .idea
+environment_for_mac.yml
+docs/local_gan_loss/
 
 #Ignore Wandb
 wandb/
