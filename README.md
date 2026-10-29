@@ -1,308 +1,374 @@
-<img src='imgs/horse2zebra.gif' align="right" width=384>
+# Local Crop CycleGAN
 
-<br><br><br>
+**Local Crop CycleGAN** は、[junyanz/pytorch-CycleGAN-and-pix2pix](https://github.com/junyanz/pytorch-CycleGAN-and-pix2pix) をベースに、
+**YOLO 形式のバウンディングボックスを使って小物体（信号機など）の領域だけに追加の GAN 損失をかける**
+よう拡張した CycleGAN です（用途例: 昼→夜変換）。**このREADMEでは昼→夜変換を例に説明します。**
 
-# CycleGAN and pix2pix in PyTorch
+ベースリポジトリの README（環境構築、pix2pix など）は [README_CycleGAN.md](README_CycleGAN.md) を参照してください。
 
-**Udpate in 2025**: we recently updated the code to support Python 3.11 and PyTorch 2.4. It also supports DDP for single-machine multiple-GPU training. (Please use `torchrun --nproc_per_node=4 train.py ...`)
+昼画像（ドメイン A）を夜画像（ドメイン B）に変換する際、信号機のような小物体は画像全体の 1% 未満の画素しか
+占めないため、大域の GAN 損失や cycle 損失にはほとんど寄与しません（勾配の希釈）。その結果、
+「画像全体は夜らしいが、信号機が光っていない(弱まっている)／色が変わっている」といった破綻が起きます。
+Local Crop CycleGAN は物体の周辺を切り出したクロップ専用の局所 Discriminator を追加し、この問題を直接補償します。
 
-**New**: Please check out [img2img-turbo](https://github.com/GaParmar/img2img-turbo) repo that includes both pix2pix-turbo and CycleGAN-Turbo. Our new one-step image-to-image translation methods can support both paired and unpaired training and produce better results by leveraging the pre-trained StableDiffusion-Turbo model. The inference time for 512x512 image is 0.29 sec on A6000 and 0.11 sec on A100.
+> **用語: local crop（局所クロップ）**
+> 本 README で「local crop」と呼ぶのは、各 bbox の中心に合わせて余白付きで切り出した正方形の局所コンテキスト窓のことです。
+> データ拡張としての画像クロップ（`--preprocess crop` や object-aware crop）とは別物で、本拡張で追加した局所 Discriminator への入力としてのみ使います。
+>
+> **用語: 前処理クロップ**
+> 元の CycleGAN がデータ読み込み時に行う、`--preprocess crop` 系（`resize_and_crop` など）による `--crop_size` の切り出しを、本 README では「前処理クロップ」と呼びます。
+> 学習・テストに使う画像そのものを作る処理で、local crop とは別物です。object-aware crop は、この前処理クロップの位置の選び方を変える拡張です。
 
-Please check out [contrastive-unpaired-translation](https://github.com/taesungp/contrastive-unpaired-translation) (CUT), our new unpaired image-to-image translation model that enables fast and memory-efficient training.
+`--lambda_local 0`（既定値）のときは局所 D を一切作らないため、`--dataset_mode unaligned` と組み合わせれば**素の CycleGAN と完全に同じ挙動**になります。
+`--dataset_mode unaligned_labeled` のまま使う場合は、学習時に object-aware crop が有効（既定値 `--object_aware_crop_p 0.5`）なので、`--object_aware_crop_p 0` も指定してください。
 
-We provide PyTorch implementations for both unpaired and paired image-to-image translation.
+---
 
-The code was written by [Jun-Yan Zhu](https://github.com/junyanz) and [Taesung Park](https://github.com/taesungp), and supported by [Tongzhou Wang](https://github.com/SsnL).
+## 変換結果（昼 → 生成した夜）
 
-This PyTorch implementation produces results comparable to or better than our original Torch software. If you would like to reproduce the same results as in the papers, check out the original [CycleGAN Torch](https://github.com/junyanz/CycleGAN) and [pix2pix Torch](https://github.com/phillipi/pix2pix) code in Lua/Torch.
+<!--
+  画像の差し替え方:
+    1. 学習済みモデルで test.py を実行する（下記「テスト」節を参照）
+    2. results/<name>/test_latest/images/ に出力される
+         xxx_real_A.png（入力の昼画像） / xxx_fake_B.png（生成した夜画像）
+       を imgs/day2night/ にコピーし、下表のファイル名に合わせてリネームする
+    3. 行を増やす場合は <tr> ブロックをコピーする
+-->
 
-**Note**: The current software works well with PyTorch 2.4+. Check out the older [branch](https://github.com/junyanz/pytorch-CycleGAN-and-pix2pix/tree/pytorch0.3.1) that supports PyTorch 0.1-0.3.
+<table>
+  <tr>
+    <th align="center">入力（昼）</th>
+    <th align="center">CycleGAN（ベースライン）</th>
+    <th align="center">Local Crop CycleGAN</th>
+  </tr>
+  <tr>
+    <td><img src="imgs/day2night/day_01.png" width="256"></td>
+    <td><img src="imgs/day2night/night_baseline_01.png" width="256"></td>
+    <td><img src="imgs/day2night/night_lccyclegan_01.png" width="256"></td>
+  </tr>
+  <tr>
+    <td><img src="imgs/day2night/day_02.png" width="256"></td>
+    <td><img src="imgs/day2night/night_baseline_02.png" width="256"></td>
+    <td><img src="imgs/day2night/night_lccyclegan_02.png" width="256"></td>
+  </tr>
+  <tr>
+    <td><img src="imgs/day2night/day_03.png" width="256"></td>
+    <td><img src="imgs/day2night/night_baseline_03.png" width="256"></td>
+    <td><img src="imgs/day2night/night_lccyclegan_03.png" width="256"></td>
+  </tr>
+</table>
 
-You may find useful information in [training/test tips](docs/tips.md) and [frequently asked questions](docs/qa.md). To implement custom models and datasets, check out our [templates](#custom-model-and-dataset). To help users better understand and adapt our codebase, we provide an [overview](docs/overview.md) of the code structure of this repository.
+- 1行目: 青信号の色と光り方（グローのサイズ）が改善
+- 2行目: 赤信号の光り方（グローのサイズ）が改善
+- 3行目: 矢印信号の色が改善
 
-**CycleGAN: [Project](https://junyanz.github.io/CycleGAN/) | [Paper](https://arxiv.org/pdf/1703.10593.pdf) | [Torch](https://github.com/junyanz/CycleGAN) |
-[Tensorflow Core Tutorial](https://www.tensorflow.org/tutorials/generative/cyclegan) | [PyTorch Colab](https://colab.research.google.com/github/junyanz/pytorch-CycleGAN-and-pix2pix/blob/master/CycleGAN.ipynb)**
+※ プライバシー保護のため、大きめに写っているナンバープレートは黒塗りで隠しています。
 
-<img src="https://junyanz.github.io/CycleGAN/images/teaser_high_res.jpg" width="800"/>
+### 実験設定
 
-**Pix2pix: [Project](https://phillipi.github.io/pix2pix/) | [Paper](https://arxiv.org/pdf/1611.07004.pdf) | [Torch](https://github.com/phillipi/pix2pix) |
-[Tensorflow Core Tutorial](https://www.tensorflow.org/tutorials/generative/pix2pix) | [PyTorch Colab](https://colab.research.google.com/github/junyanz/pytorch-CycleGAN-and-pix2pix/blob/master/pix2pix.ipynb)**
+上表は以下の設定で学習・テストした結果です。
 
-<img src="https://phillipi.github.io/pix2pix/images/teaser_v3.png" width="800px"/>
+| 項目 | CycleGAN（ベースライン） | Local Crop CycleGAN |
+| --- | --- | --- |
+| 実行したコード | 元の [pytorch-CycleGAN-and-pix2pix](https://github.com/junyanz/pytorch-CycleGAN-and-pix2pix)（commit `2a7afba`） | 本リポジトリ |
+| データセットモード | `--dataset_mode unaligned` | `--dataset_mode unaligned_labeled` |
+| object-aware crop | なし（前処理クロップの位置は一様ランダム） | あり（既定値 `--object_aware_crop_p 0.5`） |
+| クラス | 同右（データセットの画像に含まれている信号機の種類として） | 信号機 6 クラス（green / yellow / red / left / straight / right） |
+| 前処理クロップ | 同右 | `--preprocess crop --crop_size 384` |
+| エポック数 | 同右 | `--n_epochs 100 --n_epochs_decay 20`（計 120 エポック） |
+| 局所 GAN 損失 | なし | `--lambda_local 1.0` |
+| local crop の窓 | - | `--local_ctx_sizes 64,128 --local_ctx_pad 32` |
+| 局所 D | - | `--local_d_size 64 --local_n_layers_D 2 --num_classes 6`（クラス／スケール条件付きあり） |
+| テスト時の前処理 | 同右 | `--preprocess none`（前処理クロップなし、画像全体を変換） |
+| テストに使った画像 | 同右 | `--phase train`（学習用画像 `trainA` を変換） |
 
-**[EdgesCats Demo](https://affinelayer.com/pixsrv/) | [pix2pix-tensorflow](https://github.com/affinelayer/pix2pix-tensorflow) | by [Christopher Hesse](https://twitter.com/christophrhesse)**
+- ベースラインの CycleGAN は本リポジトリではなく、元の pytorch-CycleGAN-and-pix2pix（本リポジトリの分岐元である commit `2a7afba`）で学習・テストしました。
+- 元の CycleGAN に存在するオプションは、ベースラインと Local Crop CycleGAN で同じ値を使用しています。
+- ベースラインには object-aware crop が無いのに対し、Local Crop CycleGAN では有効です。そのため本比較の差は、**局所 GAN 損失と object-aware crop の両方の効果を含みます**。それぞれの寄与を切り分けるには、下記「Ablation の例」の設定で比較してください。
+- 表にないオプションは既定値です（例: `--object_aware_crop_p 0.5`、`--local_classes` 指定なし = 全クラス、`--lambda_identity 0.5`）。
+- テストは `--phase train` で行っているため、上表は**学習に使った画像に対する変換結果**です。
 
-<img src='imgs/edges2cats.jpg' width="400px"/>
+<details>
+<summary>Local Crop CycleGAN の実行コマンド</summary>
 
-If you use this code for your research, please cite:
-
-Unpaired Image-to-Image Translation using Cycle-Consistent Adversarial Networks.<br>
-[Jun-Yan Zhu](https://www.cs.cmu.edu/~junyanz/)\*, [Taesung Park](https://taesung.me/)\*, [Phillip Isola](https://people.eecs.berkeley.edu/~isola/), [Alexei A. Efros](https://people.eecs.berkeley.edu/~efros). In ICCV 2017. (\* equal contributions) [[Bibtex]](https://junyanz.github.io/CycleGAN/CycleGAN.txt)
-
-Image-to-Image Translation with Conditional Adversarial Networks.<br>
-[Phillip Isola](https://people.eecs.berkeley.edu/~isola), [Jun-Yan Zhu](https://www.cs.cmu.edu/~junyanz/), [Tinghui Zhou](https://people.eecs.berkeley.edu/~tinghuiz), [Alexei A. Efros](https://people.eecs.berkeley.edu/~efros). In CVPR 2017. [[Bibtex]](https://www.cs.cmu.edu/~junyanz/projects/pix2pix/pix2pix.bib)
-
-## Talks and Course
-
-pix2pix slides: [keynote](http://efrosgans.eecs.berkeley.edu/CVPR18_slides/pix2pix.key) | [pdf](http://efrosgans.eecs.berkeley.edu/CVPR18_slides/pix2pix.pdf),
-CycleGAN slides: [pptx](http://efrosgans.eecs.berkeley.edu/CVPR18_slides/CycleGAN.pptx) | [pdf](http://efrosgans.eecs.berkeley.edu/CVPR18_slides/CycleGAN.pdf)
-
-CycleGAN course assignment [code](http://www.cs.toronto.edu/~rgrosse/courses/csc321_2018/assignments/a4-code.zip) and [handout](http://www.cs.toronto.edu/~rgrosse/courses/csc321_2018/assignments/a4-handout.pdf) designed by Prof. [Roger Grosse](http://www.cs.toronto.edu/~rgrosse/) for [CSC321](http://www.cs.toronto.edu/~rgrosse/courses/csc321_2018/) "Intro to Neural Networks and Machine Learning" at University of Toronto. Please contact the instructor if you would like to adopt it in your course.
-
-## Colab Notebook
-
-TensorFlow Core CycleGAN Tutorial: [Google Colab](https://colab.research.google.com/github/tensorflow/docs/blob/master/site/en/tutorials/generative/cyclegan.ipynb) | [Code](https://github.com/tensorflow/docs/blob/master/site/en/tutorials/generative/cyclegan.ipynb)
-
-TensorFlow Core pix2pix Tutorial: [Google Colab](https://colab.research.google.com/github/tensorflow/docs/blob/master/site/en/tutorials/generative/pix2pix.ipynb) | [Code](https://github.com/tensorflow/docs/blob/master/site/en/tutorials/generative/pix2pix.ipynb)
-
-PyTorch Colab notebook: [CycleGAN](https://colab.research.google.com/github/junyanz/pytorch-CycleGAN-and-pix2pix/blob/master/CycleGAN.ipynb) and [pix2pix](https://colab.research.google.com/github/junyanz/pytorch-CycleGAN-and-pix2pix/blob/master/pix2pix.ipynb)
-
-ZeroCostDL4Mic Colab notebook: [CycleGAN](https://colab.research.google.com/github/HenriquesLab/ZeroCostDL4Mic/blob/master/Colab_notebooks_Beta/CycleGAN_ZeroCostDL4Mic.ipynb) and [pix2pix](https://colab.research.google.com/github/HenriquesLab/ZeroCostDL4Mic/blob/master/Colab_notebooks_Beta/pix2pix_ZeroCostDL4Mic.ipynb)
-
-## Other implementations
-
-### CycleGAN
-
-<p><a href="https://github.com/leehomyc/cyclegan-1"> [Tensorflow]</a> (by Harry Yang),
-<a href="https://github.com/architrathore/CycleGAN/">[Tensorflow]</a> (by Archit Rathore),
-<a href="https://github.com/vanhuyz/CycleGAN-TensorFlow">[Tensorflow]</a> (by Van Huy),
-<a href="https://github.com/XHUJOY/CycleGAN-tensorflow">[Tensorflow]</a> (by Xiaowei Hu),
-<a href="https://github.com/LynnHo/CycleGAN-Tensorflow-2"> [Tensorflow2]</a> (by Zhenliang He),
-<a href="https://github.com/luoxier/CycleGAN_Tensorlayer"> [TensorLayer1.0]</a> (by luoxier),
-<a href="https://github.com/tensorlayer/cyclegan"> [TensorLayer2.0]</a> (by zsdonghao),
-<a href="https://github.com/Aixile/chainer-cyclegan">[Chainer]</a> (by Yanghua Jin),
-<a href="https://github.com/yunjey/mnist-svhn-transfer">[Minimal PyTorch]</a> (by yunjey),
-<a href="https://github.com/Ldpe2G/DeepLearningForFun/tree/master/Mxnet-Scala/CycleGAN">[Mxnet]</a> (by Ldpe2G),
-<a href="https://github.com/tjwei/GANotebooks">[lasagne/Keras]</a> (by tjwei),
-<a href="https://github.com/simontomaskarlsson/CycleGAN-Keras">[Keras]</a> (by Simon Karlsson),
-<a href="https://github.com/Ldpe2G/DeepLearningForFun/tree/master/Oneflow-Python/CycleGAN">[OneFlow]</a> (by Ldpe2G)
-</p>
-</ul>
-
-### pix2pix
-
-<p><a href="https://github.com/affinelayer/pix2pix-tensorflow"> [Tensorflow]</a> (by Christopher Hesse),
-<a href="https://github.com/Eyyub/tensorflow-pix2pix">[Tensorflow]</a> (by Eyyüb Sariu),
-<a href="https://github.com/datitran/face2face-demo"> [Tensorflow (face2face)]</a> (by Dat Tran),
-<a href="https://github.com/awjuliani/Pix2Pix-Film"> [Tensorflow (film)]</a> (by Arthur Juliani),
-<a href="https://github.com/kaonashi-tyc/zi2zi">[Tensorflow (zi2zi)]</a> (by Yuchen Tian),
-<a href="https://github.com/pfnet-research/chainer-pix2pix">[Chainer]</a> (by mattya),
-<a href="https://github.com/tjwei/GANotebooks">[tf/torch/keras/lasagne]</a> (by tjwei),
-<a href="https://github.com/taey16/pix2pixBEGAN.pytorch">[Pytorch]</a> (by taey16)
-</p>
-</ul>
-
-## Prerequisites
-
-- Linux or macOS
-- Python 3
-- CPU or NVIDIA GPU + CUDA CuDNN
-
-## Getting Started
-
-### Installation
-
-- Clone this repo:
+学習:
 
 ```bash
-git clone https://github.com/junyanz/pytorch-CycleGAN-and-pix2pix
-cd pytorch-CycleGAN-and-pix2pix
+python train.py \
+    --dataroot datasets/my_dataset \
+    --name my_experiment_name \
+    --dataset_mode unaligned_labeled \
+    --preprocess crop --crop_size 384 \
+    --lambda_local 1.0 --local_ctx_sizes 64,128 --local_d_size 64 --local_ctx_pad 32 \
+    --local_n_layers_D 2 --num_classes 6 \
+    --n_epochs 100 --n_epochs_decay 20 --save_epoch_freq 10
 ```
 
-- Install [PyTorch](http://pytorch.org) and other dependencies. For Conda users, you can create a new Conda environment by
+テスト:
 
 ```bash
-conda env create -f environment.yml
+python test.py \
+    --dataroot datasets/my_dataset \
+    --name my_experiment_name \
+    --dataset_mode unaligned_labeled --preprocess none --model cycle_gan \
+    --phase train --num_test 1000000000
 ```
 
-and then activate the environment by
+</details>
+
+---
+
+## 主な変更点
+
+| 対象 | 内容 |
+| --- | --- |
+| `data/unaligned_labeled_dataset.py`（新規） | YOLO ラベル付きの unpaired データセット。画像と同一の幾何変換（リサイズ・前処理クロップ・左右反転）をラベルにも適用する |
+| `data/base_dataset.py` | `get_transformed_size` / `load_yolo_txt` / `transform_yolo_labels` を追加。`get_params` に object-aware crop を追加 |
+| `data/__init__.py` | データセットが `collate_fn` を持つ場合はそれを DataLoader に渡す（可変長ラベル対応） |
+| `models/networks.py` | 局所 D `LocalDiscriminator`（クラス／スケール条件付きの projection discriminator）と `define_local_D` を追加 |
+| `models/cycle_gan_model.py` | 局所 GAN 損失、クロップ抽出、採用率ログ、クロップ可視化を追加 |
+| `scripts/dump_local_crops.py`（新規） | 学習前に、局所 D に渡るクロップを画像として保存し確認するツール |
+| `scripts/inspect_label_scripts.py`（新規） | bbox の長辺分布を集計し、`--local_ctx_sizes` の決め方を支援するツール |
+
+### 手法の概要
+
+```
+real_A (昼) ──G_A──> fake_B (夜) ──G_B──> rec_A
+   │                    │
+   │ labels_A           │ labels_A の位置でクロップ
+   │                    v
+   │              [局所窓] ──resize──> D_A_local(crop, class, scale) <── real_B の物体クロップ
+   │
+   └─ 大域 D_A / cycle 損失 / identity 損失（従来どおり）
+```
+
+- **局所コンテキスト窓**: 各 bbox に対して「長辺 + `local_ctx_pad` 以上で最小の窓サイズ」を `--local_ctx_sizes` の候補から割り当て、
+  物体中心で正方形に切り出します。夜間のハロー・ブルームは bbox の外側に広がるため、余白付きで切り出します。
+  最大窓に収まらない bbox や、窓が画像外にはみ出す bbox は除外されます。
+- **スケール条件付け**: 切り出した窓は `--local_d_size` に統一リサイズして局所 D に渡します。
+  グロー半径は絶対ピクセルで決まるため、窓サイズ（バケット ID）を条件として与え、スケールごとの統計が混ざらないようにします。
+- **クラス条件付け**: クラス ID を条件として与えることで、「夜らしいがクラスと色が一致しない」生成（赤信号が緑になる等）を fake と判定できます。
+  検出器のデータ拡張用途ではこの種のラベルノイズが致命的になるためです。
+- **局所 D の構造**: 受容野 34px 程度の浅い PatchGAN 特徴 + global average pooling + projection 項
+  （Miyato & Koyama, *cGANs with Projection Discriminator*, ICLR 2018）。
+  正規化層の既定は `none` です（InstanceNorm は絶対輝度を消してしまい、自発光物体に不向きなため）。
+- **生成側クロップの位置**: `fake_B = G_A(real_A)` の幾何は `real_A` に従うので、`labels_A` の位置で切り出します。B→A 方向も同様です。
+- **片側 0 件時のスキップ**: real / fake どちらか一方のクロップが 0 件の反復では、局所 D の損失を 0 にします（D の偏り防止。DDP でもデッドロックしないようダミー入力で forward のみ通します）。
+- **object-aware crop**: 学習時に、物体が学習用画像に残るように前処理クロップ（元の CycleGAN のクロップ）の位置を選びます。詳細は次節を参照してください。
+
+### object-aware crop
+
+object-aware crop は、元の CycleGAN の前処理クロップ（データ拡張）で学習用画像を切り出す位置を、一様ランダムではなく
+**物体（bbox）を含むように** 選ぶ仕組みです。実装は `data/base_dataset.py` の `get_params` / `_select_target_box` / `_sample_crop_origin` にあります。
+
+#### なぜ必要か
+
+元の CycleGAN は学習時に画像を `--load_size` にリサイズした後、`--crop_size`（例: 256px）の正方形をランダムな位置で切り出します（前処理クロップ）。
+信号機のような小物体は画像のごく一部にしか写っていないため、一様ランダムな前処理クロップでは高頻度で物体が切り落とされます。
+
+```
+リサイズ後の元画像
+┌──────────────────────────────┐
+│                       [信号]  │
+│  ┌────────┐                  │  <- 一様ランダムだと、物体を含まない位置が選ばれやすい
+│  │前処理   │                  │
+│  │クロップ │                  │
+│  └────────┘                  │
+└──────────────────────────────┘
+```
+
+物体を含まない学習用画像からは local crop を 1 枚も作れないため、局所損失がかからず、
+real / fake 片側 0 件による局所 D の更新スキップも増えます。object-aware crop はこれを防ぎ、局所 D に渡るサンプル数を確保します。
+
+#### 動き方
+
+`--object_aware_crop_p`（既定値 0.5）の確率で以下を行い、残りの確率では従来どおり一様ランダムに切り出します。
+
+1. **狙う bbox を 1 つ選ぶ**（`_select_target_box`）
+   局所損失に実際に使える bbox だけを候補にし、その中からランダムに 1 つ選びます。次の bbox は候補から除外します。
+   - `--local_ctx_sizes` のどの窓にも収まらない（長辺 + `--local_ctx_pad` が最大窓を超える）bbox
+   - 割り当てられる窓が `--crop_size` より大きい bbox
+
+   これらを狙っても、モデル側の `_extract_crops` で除外されるだけで空振りになるためです。候補が無い画像では一様ランダムに戻ります。
+2. **前処理クロップの原点をサンプルする**（`_sample_crop_origin`）
+   選んだ bbox の中心が前処理クロップの端から `margin` 以上内側に入る範囲で、原点を一様にサンプルします。
+   `margin` は「その bbox に割り当てられる窓サイズの半分」と `--object_crop_margin` の大きい方で、
+   これにより local crop の窓全体が学習用画像の中に収まります。
+   物体を常に中央に置くのではなく範囲内でランダムに配置するので、物体位置の多様性は保たれます。
+3. **ラベルに同じ変換を適用する**
+   決めた前処理クロップの位置と左右反転は、`transform_yolo_labels` で YOLO ラベルにもそのまま適用されます。
+
+#### 設計上の注意点
+
+- **A / B 両ドメインに同じポリシーを適用する**
+  片方のドメインだけ物体を含みやすくすると、前処理クロップの位置の分布がドメイン間でずれ、
+  大域 D が「物体の有無」でドメインを見分けるショートカットを学習してしまいます。
+- **テスト時は自動的に無効になる**
+  `opt.isTrain` が False のときは確率 0（一様ランダム）になります。評価用の画像が「物体を含む」方向に偏ると、
+  素の CycleGAN との比較が公平でなくなるためです。
+- **`--local_ctx_sizes` / `--local_ctx_pad` はモデル側と共有される**
+  データセットはモデルのオプションを参照して窓サイズを計算するので、個別に揃える必要はありません。
+- **効果の確認**
+  `scripts/dump_local_crops.py` の出力や `local_crop_log.txt` で「画像外」による除外が多い場合は、
+  `--object_aware_crop_p` を上げるか `--crop_size` を大きくしてください。
+
+#### local crop との違い
+
+| | object-aware crop | local crop |
+| --- | --- | --- |
+| タイミング | データ読み込み時（前処理） | 学習の損失計算時 |
+| 切り出すもの | 元画像から `crop_size` の学習用画像（元の CycleGAN の前処理クロップ） | 学習用画像から bbox 中心の局所窓 |
+| 目的 | 学習用画像に物体が残るようにする | 局所 D に物体周辺だけを見せる |
+| 関係 | local crop を作れる確率を上げるための下準備 | 局所損失の計算に使う本体 |
+
+---
+
+## データセットの準備
+
+`--dataset_mode unaligned_labeled` を使います。ラベルは YOLO 形式（1 行 `cls xc yc w h`、すべて正規化座標）です。
+
+```
+<dataroot>/
+├── trainA/            # 昼画像
+├── trainA_labels/     # 昼画像の YOLO ラベル（画像と同じ相対パス、拡張子 .txt）
+├── trainB/            # 夜画像
+├── trainB_labels/     # 夜画像の YOLO ラベル
+├── testA/
+└── testB/
+```
+
+- ラベルディレクトリは `--label_dir_A` / `--label_dir_B` で任意の場所を指定できます。
+  未指定時は `<dataroot>/<phase>A_labels`、それも無ければ画像と同じディレクトリを探します。
+- ラベルファイルが無い画像は「物体なし」の正当なサンプルとして扱います（起動時に件数を警告表示します）。
+- `--lambda_local > 0` なのにラベルを返さないデータセット（`unaligned` 等）を指定した場合は、最初のバッチでエラー終了します。
+
+---
+
+## 使い方
+
+### 1. 窓サイズの決定（任意）
+
+bbox の長辺分布を見て `--local_ctx_sizes` を決めます。
 
 ```bash
-conda activate pytorch-img2img
+python scripts/inspect_label_scripts.py ./datasets/day2night/trainA_labels \
+    --img_size 640 --cls 1 --ctx_pad 16 --ctx_sizes 64,128,192
 ```
 
-- For Docker users, we provide the pre-built Docker image and Dockerfile. Please refer to our [Docker](docs/docker.md) page.
-- For Repl users, please click [![Run on Repl.it](https://repl.it/badge/github/junyanz/pytorch-CycleGAN-and-pix2pix)](https://repl.it/github/junyanz/pytorch-CycleGAN-and-pix2pix).
+各窓サイズに割り当てられる bbox の割合と、どの窓にも収まらず除外される割合が表示されます。
 
-### CycleGAN train/test
+### 2. クロップの事前確認（推奨）
 
-- Download a CycleGAN dataset (e.g. maps):
+ネットワークを作らずにデータローダとクロップ抽出だけを動かし、局所 D に渡るクロップを bbox 枠付きのタイル画像として保存します。
 
 ```bash
-bash ./datasets/download_cyclegan_dataset.sh maps
+python scripts/dump_local_crops.py --dataroot ./datasets/day2night --dataset_mode unaligned_labeled \
+    --preprocess crop --crop_size 256 --batch_size 4 --num_threads 0 \
+    --lambda_local 1.0 --local_classes 1 --num_classes 10 --local_ctx_sizes 64,128 \
+    --object_aware_crop_p 0.5 --n_batches 20 --out_dir ./local_crop_check
 ```
 
-- To log training progress and test images to W&B dashboard, set the `--use_wandb` flag with training script
-- Train a model:
+確認ポイント:
+
+- 緑枠が各タイルの中央にあり、その中に物体が丸ごと写っていること（ずれていればラベルか座標変換を疑う）
+- 「画像外」の除外が多い → `--object_aware_crop_p` を上げるか `--crop_size` を大きくする
+- 「窓なし」の除外が多い → `--local_ctx_sizes` に大きい窓を足す
+
+### 3. 学習
 
 ```bash
-#!./scripts/train_cyclegan.sh
-python train.py --dataroot ./datasets/maps --name maps_cyclegan --model cycle_gan --use_wandb
+python train.py --dataroot ./datasets/day2night --name day2night_local --model cycle_gan \
+    --dataset_mode unaligned_labeled \
+    --lambda_local 1.0 --local_classes 1 --num_classes 10 \
+    --local_ctx_sizes 64,128,192 --object_aware_crop_p 0.5
 ```
 
-To see more intermediate results, check out `./checkpoints/maps_cyclegan/web/index.html`.
+ベースライン（素の CycleGAN）は、`--dataset_mode unaligned` にして `--lambda_local` 以降の局所損失関連オプションを外すだけです。
+`--dataset_mode unaligned_labeled` のまま比較する場合は `--lambda_local 0 --object_aware_crop_p 0` としてください（`--lambda_local 0` だけでは object-aware crop が有効なままになります）。
 
-- Test the model:
+学習中は以下が追加で出力されます。
+
+- 損失: `D_A_local`, `G_A_local`, `D_B_local`, `G_B_local`
+- 可視化: `local_crops_fake_B`, `local_crops_real_B`（実際に局所 D へ渡ったクロップのタイル）
+- ログ: `checkpoints/<name>/local_crop_log.txt`（`--local_log_freq` 反復ごとのクロップ採用率・除外理由・バケット内訳・局所 D のスキップ率）
+
+### 4. テスト
 
 ```bash
-#!./scripts/test_cyclegan.sh
-python test.py --dataroot ./datasets/maps --name maps_cyclegan --model cycle_gan
+python test.py --dataroot ./datasets/day2night --name day2night_local --model cycle_gan \
+    --dataset_mode unaligned_labeled --preprocess none
 ```
 
-- The test results will be saved to a html file here: `./results/maps_cyclegan/latest_test/index.html`.
+テスト時は object-aware crop が自動で無効になります。`--preprocess crop` 系では元の CycleGAN の前処理クロップの位置が乱数で決まるため、
+決定的な評価をしたい場合は `--preprocess none` または `resize` を使ってください。
+結果は `results/<name>/test_latest/images/` に `*_real_A.png`（昼） / `*_fake_B.png`（生成した夜）として保存されます。
 
-### pix2pix train/test
+---
 
-- Download a pix2pix dataset (e.g.[facades](http://cmp.felk.cvut.cz/~tylecr1/facade/)):
+## 追加オプション一覧
 
-```bash
-bash ./datasets/download_pix2pix_dataset.sh facades
-```
+### モデル（`--model cycle_gan`、学習時のみ）
 
-- To log training progress and test images to W&B dashboard, set the `--use_wandb` flag with training script
-- Train a model:
+| オプション | 既定値 | 説明 |
+| --- | --- | --- |
+| `--lambda_local` | `0.0` | 局所 GAN 損失の重み。0 で無効（素の CycleGAN） |
+| `--local_ctx_sizes` | `64,128,192` | 局所窓サイズの候補（px、カンマ区切り）。`64` のみなら単一スケール |
+| `--local_d_size` | `64` | 局所 D への入力サイズ（px） |
+| `--local_ctx_pad` | `16` | bbox 周囲に確保するコンテキスト幅（px、上下左右合計） |
+| `--local_max_crops` | `32` | 1 ステップあたりのクロップ数上限（メモリ対策） |
+| `--local_classes` | `""` | 局所損失を適用するクラス ID（カンマ区切り）。空なら全クラス |
+| `--num_classes` | `80` | YOLO ラベルのクラス数（クラス埋め込みのサイズ） |
+| `--local_n_layers_D` | `2` | 局所 D の conv 層数 |
+| `--local_ndf` | `64` | 局所 D の最初の conv のフィルタ数 |
+| `--local_norm` | `none` | 局所 D の正規化層 `batch` / `instance` / `none` |
+| `--local_log_freq` | `100` | クロップ採用状況をログ出力する間隔（反復数）。0 で無効 |
+| `--local_vis_max` | `32` | 可視化に載せるクロップの最大枚数 |
+| `--no_local_cond` | - | 局所 D のクラス／スケール条件付けを両方無効化（ablation 用） |
+| `--no_local_cls_cond` | - | クラス条件付けのみ無効化（ablation 用） |
+| `--no_local_scale_cond` | - | スケール条件付けのみ無効化（ablation 用） |
 
-```bash
-#!./scripts/train_pix2pix.sh
-python train.py --dataroot ./datasets/facades --name facades_pix2pix --model pix2pix --direction BtoA  --use_wandb
-```
+### データセット（`--dataset_mode unaligned_labeled`）
 
-To see more intermediate results, check out `./checkpoints/facades_pix2pix/web/index.html`.
+| オプション | 既定値 | 説明 |
+| --- | --- | --- |
+| `--label_dir_A` / `--label_dir_B` | `""` | 各ドメインのラベルディレクトリ |
+| `--object_aware_crop_p` | `0.5` | GT ボックスを含むように前処理クロップの位置を選ぶ確率（学習時のみ有効） |
+| `--object_crop_margin` | `32` | 物体中心を前処理クロップの端から離す最小距離（px） |
+| `--min_visibility` | `0.3` | 前処理クロップ後に残った面積比がこれ以下の bbox を捨てる閾値 |
 
-- Test the model (`bash ./scripts/test_pix2pix.sh`):
+---
 
-```bash
-#!./scripts/test_pix2pix.sh
-python test.py --dataroot ./datasets/facades --name facades_pix2pix --model pix2pix --direction BtoA
-```
+## Ablation の例
 
-- The test results will be saved to a html file here: `./results/facades_pix2pix/test_latest/index.html`. You can find more scripts at `scripts` directory.
-- To train and test pix2pix-based colorization models, please add `--model colorization` and `--dataset_mode colorization`. See our training [tips](https://github.com/junyanz/pytorch-CycleGAN-and-pix2pix/blob/master/docs/tips.md#notes-on-colorization) for more details.
+いずれも `--dataset_mode unaligned_labeled` で、学習コマンドに以下のフラグを追加します（局所 D の条件付けを外す設定は object-aware crop 有効のまま）。
 
-### Apply a pre-trained model (CycleGAN)
+| 設定 | 追加フラグ |
+| --- | --- |
+| ベースライン（素の CycleGAN） | `--lambda_local 0 --object_aware_crop_p 0` |
+| object-aware crop のみ | `--lambda_local 0` |
+| 局所損失のみ（object-aware crop なし） | `--lambda_local 1.0 --object_aware_crop_p 0` |
+| 局所損失（条件なし） | `--lambda_local 1.0 --no_local_cond` |
+| 局所損失（クラス条件のみ） | `--lambda_local 1.0 --no_local_scale_cond` |
+| 局所損失（スケール条件のみ） | `--lambda_local 1.0 --no_local_cls_cond` |
+| Local Crop CycleGAN（フル） | `--lambda_local 1.0` |
 
-- You can download a pretrained model (e.g. horse2zebra) with the following script:
+---
 
-```bash
-bash ./scripts/download_cyclegan_model.sh horse2zebra
-```
+## 謝辞・引用
 
-- The pretrained model is saved at `./checkpoints/{name}_pretrained/latest_net_G.pth`. Check [here](https://github.com/junyanz/pytorch-CycleGAN-and-pix2pix/blob/master/scripts/download_cyclegan_model.sh#L3) for all the available CycleGAN models.
-- To test the model, you also need to download the horse2zebra dataset:
+本コードは以下の実装をベースにしています。
 
-```bash
-bash ./datasets/download_cyclegan_dataset.sh horse2zebra
-```
-
-- Then generate the results using
-
-```bash
-python test.py --dataroot datasets/horse2zebra/testA --name horse2zebra_pretrained --model test --no_dropout
-```
-
-- The option `--model test` is used for generating results of CycleGAN only for one side. This option will automatically set `--dataset_mode single`, which only loads the images from one set. On the contrary, using `--model cycle_gan` requires loading and generating results in both directions, which is sometimes unnecessary. The results will be saved at `./results/`. Use `--results_dir {directory_path_to_save_result}` to specify the results directory.
-
-- For pix2pix and your own models, you need to explicitly specify `--netG`, `--norm`, `--no_dropout` to match the generator architecture of the trained model. See this [FAQ](https://github.com/junyanz/pytorch-CycleGAN-and-pix2pix/blob/master/docs/qa.md#runtimeerror-errors-in-loading-state_dict-812-671461-296) for more details.
-
-### Apply a pre-trained model (pix2pix)
-
-Download a pre-trained model with `./scripts/download_pix2pix_model.sh`.
-
-- Check [here](https://github.com/junyanz/pytorch-CycleGAN-and-pix2pix/blob/master/scripts/download_pix2pix_model.sh#L3) for all the available pix2pix models. For example, if you would like to download label2photo model on the Facades dataset,
-
-```bash
-bash ./scripts/download_pix2pix_model.sh facades_label2photo
-```
-
-- Download the pix2pix facades datasets:
-
-```bash
-bash ./datasets/download_pix2pix_dataset.sh facades
-```
-
-- Then generate the results using
-
-```bash
-python test.py --dataroot ./datasets/facades/ --direction BtoA --model pix2pix --name facades_label2photo_pretrained
-```
-
-- Note that we specified `--direction BtoA` as Facades dataset's A to B direction is photos to labels.
-
-- If you would like to apply a pre-trained model to a collection of input images (rather than image pairs), please use `--model test` option. See `./scripts/test_single.sh` for how to apply a model to Facade label maps (stored in the directory `facades/testB`).
-
-- See a list of currently available models at `./scripts/download_pix2pix_model.sh`
-
-### Multi-GPU training
-
-To train a model on multiple GPUs, please use `torchrun --nproc_per_node=4 train.py ...` instead of `python train.py ...`. We also need to use synchronized batchnorm by setting `--norm sync_batch` (or `--norm sync_instance` for instance normgalization). The `--norm batch` is not compatible with DDP.
-
-## [Docker](docs/docker.md)
-
-We provide the pre-built Docker image and Dockerfile that can run this code repo. See [docker](docs/docker.md).
-
-## [Datasets](docs/datasets.md)
-
-Download pix2pix/CycleGAN datasets and create your own datasets.
-
-## [Training/Test Tips](docs/tips.md)
-
-Best practice for training and testing your models.
-
-## [Frequently Asked Questions](docs/qa.md)
-
-Before you post a new question, please first look at the above Q & A and existing GitHub issues.
-
-## Custom Model and Dataset
-
-If you plan to implement custom models and dataset for your new applications, we provide a dataset [template](data/template_dataset.py) and a model [template](models/template_model.py) as a starting point.
-
-## [Code structure](docs/overview.md)
-
-To help users better understand and use our code, we briefly overview the functionality and implementation of each package and each module.
-
-## Pull Request
-
-You are always welcome to contribute to this repository by sending a [pull request](https://help.github.com/articles/about-pull-requests/).
-Please run `flake8 --ignore E501 .` and `pytest scripts/test_before_push.py -v` before you commit the code. Please also update the code structure [overview](docs/overview.md) accordingly if you add or remove files.
-
-## Citation
-
-If you use this code for your research, please cite our papers.
-
-```
+```bibtex
 @inproceedings{CycleGAN2017,
   title={Unpaired Image-to-Image Translation using Cycle-Consistent Adversarial Networks},
   author={Zhu, Jun-Yan and Park, Taesung and Isola, Phillip and Efros, Alexei A},
   booktitle={Computer Vision (ICCV), 2017 IEEE International Conference on},
   year={2017}
 }
-
-
-@inproceedings{isola2017image,
-  title={Image-to-Image Translation with Conditional Adversarial Networks},
-  author={Isola, Phillip and Zhu, Jun-Yan and Zhou, Tinghui and Efros, Alexei A},
-  booktitle={Computer Vision and Pattern Recognition (CVPR), 2017 IEEE Conference on},
-  year={2017}
-}
 ```
 
-## Other Languages
+局所 D の条件付けは以下を参考にしています。
 
-[Spanish](docs/README_es.md)
+- T. Miyato and M. Koyama, "cGANs with Projection Discriminator," ICLR 2018.
 
-## Related Projects
-
-[img2img-turbo](https://github.com/GaParmar/img2img-turbo)<br>
-[contrastive-unpaired-translation](https://github.com/taesungp/contrastive-unpaired-translation) (CUT)<br>
-[CycleGAN-Torch](https://github.com/junyanz/CycleGAN) |
-[pix2pix-Torch](https://github.com/phillipi/pix2pix) | [pix2pixHD](https://github.com/NVIDIA/pix2pixHD)|
-[BicycleGAN](https://github.com/junyanz/BicycleGAN) | [vid2vid](https://tcwang0509.github.io/vid2vid/) | [SPADE/GauGAN](https://github.com/NVlabs/SPADE)<br>
-[iGAN](https://github.com/junyanz/iGAN) | [GAN Dissection](https://github.com/CSAILVision/GANDissect) | [GAN Paint](http://ganpaint.io/)
-
-## Cat Paper Collection
-
-If you love cats, and love reading cool graphics, vision, and learning papers, please check out the Cat Paper [Collection](https://github.com/junyanz/CatPapers).
-
-## Acknowledgments
-
-Our code is inspired by [pytorch-DCGAN](https://github.com/pytorch/examples/tree/master/dcgan).
+ベースリポジトリの使い方（環境構築、pix2pix、学習のヒント等）は [README_CycleGAN.md](README_CycleGAN.md) および [docs/](docs/) を参照してください。
